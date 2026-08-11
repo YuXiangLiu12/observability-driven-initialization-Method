@@ -8,11 +8,6 @@
 
 void gyroBiasEstimator(std::map<double, ImageFrame> &all_image_frame, Eigen::Vector3d &Bg);
 
-void exrotEstimatorDoc(std::map<double, ImageFrame> &all_image_frame,
-                       Eigen::Vector3d &Bg,
-                       bool estimate_td = false,
-                       bool estimate_Rbc = false);
-
 // 文档模型外层迭代版：联合估计 bg / Rbc / td（drt_Exrot_dt.md §6）
 // 每轮外层迭代：用当前 bg 重积分(repropagate) -> 多跨度帧对链式累积 -> 内层 LM 求增量
 //              -> 更新状态 -> 增量/代价收敛则提前停止（最多 max_outer_iter 轮）
@@ -30,32 +25,6 @@ void exrotEstimatorDocIterative(std::map<double, ImageFrame> &all_image_frame,
                                 double robust_loss_scale = 0.0,
                                 double *td_out = nullptr);   // 输出优化后的 td（后检测需要）
 
-// 残差模型海森矩阵分析（参考 exrotEstimatorDocIterative 内 §8 可观性检查）：
-// 在给定状态 (bg, Rbc=RIC[0], td=0) 下收集多跨度帧对，对残差
-// e = sqrt(max(λmin(M), ελ)) 做中心差分得到 Jacobian J，计算 Gauss-Newton 海森
-// H = J^T J 的特征值、条件数 κ=λ_max/λ_min 及最弱/最强可观方向并打印。
-// 同时输出参数可观性指标（理论公式见实现注释）：
-//   σ̂² = (1/n_res)·Σe_i²                   残差方差估计
-//   C  = σ̂²·H⁻¹ = σ̂²·Σ_k(v_k v_kᵀ)/λ_k    参数协方差 (CRLB)
-//   σ_i = σ̂·√C_ii                          参数 p_i 的 1σ 不确定度
-//   SNR_i = tol_i/σ_i                       可观性得分，>1 即稳定可观
-//   δ_k  = σ̂/√λ_k                          沿特征方向 v_k 的 1σ 不确定度
-// 判据：全部参数稳定可观 ⟺ min_i SNR_i > 1 ⟺ max_i σ_i < tol_i
-// 返回值：true = 旋转外参(Rbc)与时间延时(td)均稳定可观；false = Rbc 或 td 存在未达容差。
-//         （bg 不参与触发门控——它通常最先达标，且残差签名随跨度增长、信息最强。）
-// 容差默认值：tol_bg=1e-3 rad/s、tol_theta=1°、tol_td=2ms，可按需传入修改。
-// 参数维度：0..2 = bg，3..5 = Rbc 右扰动 θ，6 = td（按 estimate_* 开关裁剪）。
-bool hessianConditionAnalysis(std::map<double, ImageFrame> &all_image_frame,
-                              const Eigen::Vector3d &Bg,
-                              bool estimate_td = true,
-                              bool estimate_Rbc = true,
-                              int max_pair_step = 4,
-                              int min_pair_step = 2,
-                              int min_features = 8,
-                              double eps_lambda = 1e-20,
-                              double tol_bg    = 1e-3,
-                              double tol_theta = 3.14159265358979323846 / 180.0,
-                              double tol_td    = 2e-3);
 
 // ============================================================================
 // 可观测性门控（rotation_observability_analysis.md §5/§7-§11）
@@ -185,3 +154,66 @@ ObsDecision observabilityGate(
     double eps_lambda = 1e-20,
     const ObsGateParams &params = ObsGateParams(),
     ObsDiagnostics *diag = nullptr);
+
+// ============================================================================
+// 已知旋转下基于极线约束的帧间平移计算（fixed_rotation_camera_translation_initialization_corrected.md §4-§7）
+// ----------------------------------------------------------------------------
+// 输入：all_image_frame —— 每帧的相机旋转 frame.Rc0c（^c0 R_ci）已由旋转优化得到。
+// 输出：写回 frame.Tc0c（= ^c0 p_ci，视觉尺度下的相机中心位置）、frame.R、frame.T。
+// 返回：true = 成功写出位置；false = 数据不足 / 退化。
+// 步骤（对应文档）：
+//   1) 有序帧表 R[i]（第0帧为参考，必要时左乘 R0^T 归一化）            §3.2
+//   2) 多跨度帧对收集共视 bearing，M_ij 谱诊断过滤                     §4.2/§6
+//   3) 全局位置系统 A_p x_p = 0，H_p = A_p^T A_p 最小特征向量           §5.1
+//   4) 用基线最大的帧对归一化视觉尺度                                   §5.2
+//   5) 二视图正深度检查消解整体符号二义性                               §5.3
+//   6) 写回 Rc0c / Tc0c / R / T                                        §7
+// 注意：单目极线约束只恢复"视觉尺度"下的位置；米制尺度由后续
+//       VisualIMUAlignment 恢复，本函数不触碰 TIC[0]（§8）。
+//       阈值（tau_ratio / tau_energy）应按数据标定（§6），默认值较宽松。
+bool translationEstimator(std::map<double, ImageFrame> &all_image_frame,
+                          int min_features = 8,
+                          int min_pair_step = 2,
+                          int max_pair_step = 4,
+                          double tau_ratio = 0.9,     // §6 谱比 λ1/λ2 上限
+                          double tau_energy = 1e-8,   // §6 q_ij = λ2 能量下限
+                          bool verbose = true);
+
+// ============================================================================
+// 消去速度后的尺度、重力与加速度计零偏闭式解算
+// 文档：closed_form_scale_gravity_accel_bias_velocity_eliminated_规范化审核版.md
+// ----------------------------------------------------------------------------
+// 输入：all_image_frame —— frame.R（^c0 R_bi）、frame.T（视觉尺度相机中心）、
+//       以及已用最终 bg 重积分（repropagate）的 pre_integration（δp/δv/J_b_a）。
+// 输出：s = 单目视觉尺度；g_c0 = c0 系物理重力向量（向下，= -G_code）；
+//       ba = 绝对加速度计零偏（= bar_ba + δb_a）。
+// 返回：true = 解算成功（N≥5、rank=7、条件数≤tau_kappa、s>0）；false = 失败/退化。
+// 方法（文档 §4-§7）：位置方程消去速度，构造固定 7 列线性系统 A_red x = b_red，
+//       x = [s, g^c0, δb_a]；列主元 QR + SVD 最小二乘求解。
+bool scaleGravityBiasEstimator(std::map<double, ImageFrame> &all_image_frame,
+                               double &s,
+                               Eigen::Vector3d &g_c0,
+                               Eigen::Vector3d &ba,
+                               double tau_gravity = 0.5, // ||g||-G 容差 (m/s²)，仅告警
+                               double tau_kappa = 1e8,   // A_red 条件数上限（硬拒绝）
+                               bool verbose = true);
+
+// ============================================================================
+// 视觉-惯性对齐：旋转优化结果 → 矫正预积分 → Rc0c → Tc0c → 尺度/重力/零偏
+// 文档：fixed_rotation_camera_translation_initialization_corrected.md §3/§9
+//       + closed_form_scale_gravity_accel_bias_velocity_eliminated_规范化审核版.md
+// ----------------------------------------------------------------------------
+// 输入：all_image_frame（含预积分与共视特征）；旋转优化估计的 bg / q_bc(Rbc) / td。
+// 步骤：1) 用 bg 矫正 IMU 预积分（repropagate，§6.2）
+//       2) 用优化后的 Rbc 逐帧累积相机旋转 Rc0c（§3.2/§3.3）
+//       3) 调用 translationEstimator 计算相机平移 Tc0c（阈值更严格）
+//       4) 调用 scaleGravityBiasEstimator 闭式解算尺度/物理重力/加计零偏
+// 注意：当前工程预积分不含 td，按文档 §3.1/§3.3 此处置 td=0。
+// 可选输出：s_out / g_c0_out / ba_out（scaleGravityBiasEstimator 的结果）。
+void VisionIMuAlignment(std::map<double, ImageFrame> &all_image_frame,
+                        Eigen::Vector3d bg,
+                        Eigen::Quaterniond q_bc,
+                        double td,
+                        double *s_out = nullptr,
+                        Eigen::Vector3d *g_c0_out = nullptr,
+                        Eigen::Vector3d *ba_out = nullptr);
