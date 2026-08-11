@@ -1,0 +1,14 @@
+<launch>
+    <!-- Run the data generator (publishes imu + features + ground truth) -->
+    <node pkg="data_generator" name="data_generator" type="data_generator" output="log" />
+
+    <!-- Record exactly the topics needed by vins_estimator + ground truth for evaluation.
+         Do NOT record /data_generator/path (ever-growing Path message) or /pose
+         (single-frame pose is redundant with odometry) - they blow up the bag size.
+         Ctrl+C to stop; bag is saved to $(HOME)/sim_vins.bag.
+         NOTE: args must be on a single line; backslash line-continuations are passed to
+         rosbag record as literal args and cause InvalidNameException. -->
+    <node pkg="rosbag" name="rosbag_record" type="record" output="screen"
+          args="-O $(env HOME)/sim_vins.bag /data_generator/imu /feature_tracker/feature /data_generator/odometry" />
+
+</launch>
