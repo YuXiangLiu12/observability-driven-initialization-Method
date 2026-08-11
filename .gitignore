@@ -1,0 +1,33 @@
+# ---- ROS / catkin 构建产物 ----
+build/
+devel/
+logs/
+.catkin_tools/
+install/
+
+# ---- C++ 编译产物 ----
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.out
+*.class
+*.pyc
+__pycache__/
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+*.bak
